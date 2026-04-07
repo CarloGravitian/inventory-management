@@ -2,7 +2,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from pydantic import BaseModel
+from datetime import datetime, timedelta
+import uuid
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
+
+# In-memory store for restocking orders (not persisted to file)
+restocking_orders = []
 
 app = FastAPI(title="Factory Inventory Management System")
 
@@ -303,6 +308,132 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+# --- Restocking models ---
+
+class RestockingRecommendation(BaseModel):
+    sku: str
+    name: str
+    category: str
+    warehouse: str
+    quantity_on_hand: int
+    reorder_point: int
+    unit_cost: float
+    quantity_to_order: int
+    estimated_cost: float
+    # Demand context — present when a matching forecast exists for this SKU
+    forecasted_demand: Optional[int] = None
+    demand_trend: Optional[str] = None
+    priority_score: float  # Higher = more urgent
+
+class RestockingOrderItem(BaseModel):
+    sku: str
+    name: str
+    quantity: int
+    unit_cost: float
+
+class SubmitRestockingOrderRequest(BaseModel):
+    items: List[RestockingOrderItem]
+    total_cost: float
+
+class RestockingOrder(BaseModel):
+    id: str
+    order_number: str
+    submitted_date: str
+    expected_delivery: str
+    status: str
+    items: List[dict]
+    total_cost: float
+
+
+# --- Restocking endpoints ---
+
+@app.get("/api/restocking/recommendations", response_model=List[RestockingRecommendation])
+def get_restocking_recommendations(budget: float = 0):
+    """
+    Return low-stock items ranked by urgency, trimmed to fit the given budget.
+    Priority score = stock_deficit_ratio * demand_growth_multiplier.
+    Items with a demand forecast get a boost; all low-stock items are included.
+    """
+    # Build a lookup from SKU → demand forecast for O(1) access
+    demand_by_sku = {f["item_sku"]: f for f in demand_forecasts}
+
+    candidates = []
+    for item in inventory_items:
+        # Only recommend items that are at or below their reorder point
+        if item["quantity_on_hand"] > item["reorder_point"]:
+            continue
+
+        # How far below reorder point, as a ratio (0–1; higher = more urgent)
+        deficit = item["reorder_point"] - item["quantity_on_hand"]
+        deficit_ratio = deficit / item["reorder_point"] if item["reorder_point"] > 0 else 0
+
+        # Boost score if this SKU has a demand forecast with growth
+        demand_multiplier = 1.0
+        forecast = demand_by_sku.get(item["sku"])
+        forecasted_demand = None
+        demand_trend = None
+        if forecast and forecast["current_demand"] > 0:
+            demand_multiplier = forecast["forecasted_demand"] / forecast["current_demand"]
+            forecasted_demand = forecast["forecasted_demand"]
+            demand_trend = forecast["trend"]
+
+        priority_score = round(deficit_ratio * demand_multiplier, 4)
+
+        # Restock to 2× reorder point — a common replenishment rule
+        quantity_to_order = max(0, item["reorder_point"] * 2 - item["quantity_on_hand"])
+        estimated_cost = round(quantity_to_order * item["unit_cost"], 2)
+
+        candidates.append({
+            "sku": item["sku"],
+            "name": item["name"],
+            "category": item["category"],
+            "warehouse": item["warehouse"],
+            "quantity_on_hand": item["quantity_on_hand"],
+            "reorder_point": item["reorder_point"],
+            "unit_cost": item["unit_cost"],
+            "quantity_to_order": quantity_to_order,
+            "estimated_cost": estimated_cost,
+            "forecasted_demand": forecasted_demand,
+            "demand_trend": demand_trend,
+            "priority_score": priority_score,
+        })
+
+    # Sort highest priority first, then greedily select items within budget
+    candidates.sort(key=lambda x: x["priority_score"], reverse=True)
+
+    result = []
+    remaining = budget
+    for c in candidates:
+        if c["estimated_cost"] <= remaining:
+            result.append(c)
+            remaining -= c["estimated_cost"]
+
+    return result
+
+
+@app.post("/api/restocking/orders", response_model=RestockingOrder)
+def submit_restocking_order(request: SubmitRestockingOrderRequest):
+    """Submit a restocking order. Stored in memory with a 7-day lead time."""
+    now = datetime.utcnow()
+    order = {
+        "id": str(uuid.uuid4()),
+        "order_number": f"RST-{now.strftime('%Y%m%d%H%M%S')}",
+        "submitted_date": now.isoformat(),
+        "expected_delivery": (now + timedelta(days=7)).isoformat(),
+        "status": "Processing",
+        "items": [item.model_dump() for item in request.items],
+        "total_cost": request.total_cost,
+    }
+    restocking_orders.append(order)
+    return order
+
+
+@app.get("/api/restocking/orders", response_model=List[RestockingOrder])
+def get_restocking_orders():
+    """Return all submitted restocking orders, newest first."""
+    return list(reversed(restocking_orders))
+
 
 if __name__ == "__main__":
     import uvicorn

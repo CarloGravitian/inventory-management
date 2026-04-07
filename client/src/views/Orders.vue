@@ -5,6 +5,51 @@
       <p>{{ t('orders.description') }}</p>
     </div>
 
+    <!-- Submitted Restocking Orders — only rendered when orders exist -->
+    <div v-if="restockingOrders.length > 0" class="card restocking-orders-card">
+      <div class="card-header">
+        <h3 class="card-title">Submitted Restocking Orders</h3>
+      </div>
+      <div class="table-container">
+        <table class="restocking-table">
+          <thead>
+            <tr>
+              <th>Order Number</th>
+              <th>Submitted Date</th>
+              <th>Items</th>
+              <th>Expected Delivery</th>
+              <th>Status</th>
+              <th>Total Cost</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="ro in restockingOrders" :key="ro.order_number">
+              <td><strong>{{ ro.order_number }}</strong></td>
+              <td>{{ formatDate(ro.submitted_at) }}</td>
+              <td>
+                <details class="items-details">
+                  <summary class="items-summary">
+                    {{ ro.items.length }} {{ ro.items.length === 1 ? 'item' : 'items' }}
+                  </summary>
+                  <div class="items-dropdown">
+                    <div v-for="item in ro.items" :key="item.sku" class="item-entry">
+                      <span class="item-name">{{ item.name }} ({{ item.sku }})</span>
+                      <span class="item-meta">Qty: {{ item.quantity }} @ ${{ item.unit_cost }}</span>
+                    </div>
+                  </div>
+                </details>
+              </td>
+              <td>{{ formatDate(ro.expected_delivery) }}</td>
+              <td>
+                <span class="badge warning">Processing</span>
+              </td>
+              <td><strong>${{ ro.total_cost.toLocaleString() }}</strong></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
     <div v-if="loading" class="loading">{{ t('common.loading') }}</div>
     <div v-else-if="error" class="error">{{ error }}</div>
     <div v-else>
@@ -95,6 +140,7 @@ export default {
     const loading = ref(true)
     const error = ref(null)
     const orders = ref([])
+    const restockingOrders = ref([])
 
     // Use shared filters
     const {
@@ -153,13 +199,27 @@ export default {
       })
     }
 
-    onMounted(loadOrders)
+    // Load submitted restocking orders once on mount — no polling needed
+    const loadRestockingOrders = async () => {
+      try {
+        restockingOrders.value = await api.getRestockingOrders()
+      } catch (err) {
+        // Non-critical: silently fail so the main orders view still loads
+        console.error('Failed to load restocking orders:', err)
+      }
+    }
+
+    onMounted(() => {
+      loadOrders()
+      loadRestockingOrders()
+    })
 
     return {
       t,
       loading,
       error,
       orders,
+      restockingOrders,
       getOrdersByStatus,
       getOrderStatusClass,
       formatDate,
@@ -172,6 +232,17 @@ export default {
 </script>
 
 <style scoped>
+/* Restocking orders section */
+.restocking-orders-card {
+  margin-bottom: 1.5rem;
+  border-left: 4px solid #f59e0b;
+}
+
+.restocking-table {
+  table-layout: auto;
+  width: 100%;
+}
+
 /* Fixed table layout to prevent column shifting */
 .orders-table {
   table-layout: fixed;
